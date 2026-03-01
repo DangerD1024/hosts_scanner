@@ -243,8 +243,76 @@ class NetworkScannerThread(QThread):
         return NetworkScannerThread._arp_linux(iface)
 
     @staticmethod
+    def _is_noarp(iface: str) -> bool:
+        """Return True if the interface has the NOARP flag (e.g. WireGuard, tun)."""
+        try:
+            result = subprocess.run(
+                ['ip', 'link', 'show', iface],
+                capture_output=True, text=True, timeout=5, check=False,
+            )
+            return 'NOARP' in result.stdout
+        except (FileNotFoundError, subprocess.TimeoutExpired, subprocess.SubprocessError):
+            return False
+
+    @staticmethod
+    def _get_iface_addr(iface: str) -> Optional[Tuple[str, int]]:
+        """Return (ip, prefix_len) of the first IPv4 address on the interface."""
+        try:
+            result = subprocess.run(
+                ['ip', '-o', 'addr', 'show', 'dev', iface],
+                capture_output=True, text=True, timeout=5, check=False,
+            )
+            for line in result.stdout.split('\n'):
+                m = re.search(r'inet (\d+\.\d+\.\d+\.\d+)/(\d+)', line)
+                if m:
+                    return m.group(1), int(m.group(2))
+        except (FileNotFoundError, subprocess.TimeoutExpired, subprocess.SubprocessError):
+            pass
+        return None
+
+    @staticmethod
+    def _ping_sweep_noarp(iface: str) -> List[Tuple[str, str, str]]:
+        """Parallel ping sweep for NOARP interfaces (WireGuard, tun, etc.).
+
+        Derives the /24 subnet from the interface address and pings all 254
+        hosts simultaneously, returning those that respond.
+        """
+        addr_info = NetworkScannerThread._get_iface_addr(iface)
+        if not addr_info:
+            return []
+        local_ip, _ = addr_info
+        # Always sweep a /24 derived from the interface IP to avoid scanning
+        # thousands of hosts on wider subnets.
+        prefix = '.'.join(local_ip.split('.')[:3])
+
+        procs: Dict[str, subprocess.Popen] = {}
+        for i in range(1, 255):
+            ip = f'{prefix}.{i}'
+            if ip == local_ip:
+                continue
+            procs[ip] = subprocess.Popen(
+                ['ping', '-c1', '-W1', ip],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+
+        devices: List[Tuple[str, str, str]] = []
+        for ip, proc in procs.items():
+            try:
+                if proc.wait(timeout=3) == 0:
+                    devices.append((ip, '', ''))
+            except subprocess.TimeoutExpired:
+                proc.kill()
+        return devices
+
+    @staticmethod
     def _arp_linux(iface: Optional[str] = None) -> List[Tuple[str, str, str]]:
-        """Try arp-scan first, fall back to 'ip neigh'."""
+        """Try arp-scan first, fall back to 'ip neigh'.
+        For NOARP interfaces (WireGuard, tun) use a parallel ping sweep instead."""
+        # NOARP interfaces have no MAC layer — arp-scan and ip neigh both fail.
+        if iface and NetworkScannerThread._is_noarp(iface):
+            return NetworkScannerThread._ping_sweep_noarp(iface)
+
         devices: List[Tuple[str, str, str]] = []
         seen: set[str] = set()
 
