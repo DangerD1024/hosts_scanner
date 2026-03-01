@@ -1,0 +1,12 @@
+[Desktop Entry]
+Version=1.0
+Type=Application
+Name=Hosts List
+Comment=Network Scanner - View devices on your local network
+Exec=/home/dangerd/Documents/Work/Tools/hosts
+TryExec=/home/dangerd/Documents/Work/Tools/hosts
+Path=/home/dangerd/Documents/Work/Tools
+Icon=network-workgroup
+Terminal=false
+Categories=Network;System;
+StartupNotify=true
