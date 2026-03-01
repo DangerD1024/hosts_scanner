@@ -13,6 +13,7 @@ import ssl
 import time
 import platform
 import base64
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Optional, Tuple, List, Dict
 from urllib.request import urlopen, Request
@@ -25,11 +26,44 @@ _SUBPROCESS_FLAGS: Dict = {}
 if IS_WINDOWS:
     _SUBPROCESS_FLAGS['creationflags'] = subprocess.CREATE_NO_WINDOW
 
+
+def get_local_interfaces() -> List[str]:
+    """Return non-loopback interface names that are currently up."""
+    interfaces: List[str] = []
+    if IS_WINDOWS:
+        try:
+            result = subprocess.run(
+                ['ipconfig'],
+                capture_output=True, text=True, timeout=5, check=False,
+                **_SUBPROCESS_FLAGS,
+            )
+            for line in result.stdout.split('\n'):
+                m = re.match(r'^[\w\s]+ adapter (.+):$', line)
+                if m:
+                    interfaces.append(m.group(1).strip())
+        except (FileNotFoundError, subprocess.TimeoutExpired, subprocess.SubprocessError):
+            pass
+    else:
+        try:
+            result = subprocess.run(
+                ['ip', '-o', 'link', 'show', 'up'],
+                capture_output=True, text=True, timeout=5, check=False,
+            )
+            for line in result.stdout.split('\n'):
+                m = re.match(r'^\d+:\s+(\S+):', line)
+                if m:
+                    name = m.group(1).split('@')[0]  # strip veth peer suffix
+                    if name != 'lo':
+                        interfaces.append(name)
+        except (FileNotFoundError, subprocess.TimeoutExpired, subprocess.SubprocessError):
+            pass
+    return interfaces
+
 try:
     from PyQt6.QtWidgets import (
         QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
         QTableWidget, QTableWidgetItem, QPushButton, QLabel, QMessageBox,
-        QHeaderView, QProgressDialog
+        QHeaderView, QProgressDialog, QComboBox
     )
     from PyQt6.QtCore import Qt, QThread, pyqtSignal, QTimer
     from PyQt6.QtGui import QClipboard, QFont
@@ -156,12 +190,15 @@ class NetworkScannerThread(QThread):
     Secondary: local ARP table — arp-scan on Linux, 'arp -a' on Windows.
     The two are merged so devices not in DHCP (e.g. static IPs) still appear.
     """
+    device_found = pyqtSignal(str, str, str)  # ip, mac, vendor_raw
     finished = pyqtSignal(list)
     error = pyqtSignal(str)
 
-    def __init__(self, mikrotik_client: Optional['MikroTikClient'] = None):
+    def __init__(self, mikrotik_client: Optional['MikroTikClient'] = None,
+                 iface: Optional[str] = None):
         super().__init__()
         self.mikrotik_client = mikrotik_client
+        self.iface = iface
 
     def run(self):
         seen_ips: set[str] = set()
@@ -176,16 +213,18 @@ class NetworkScannerThread(QThread):
                     if ip and ip not in seen_ips:
                         seen_ips.add(ip)
                         devices.append((ip, mac, ''))
+                        self.device_found.emit(ip, mac, '')
             except Exception as e:
                 print(f'[MikroTik] lease fetch in scanner: {e}')
 
         # 2. Local ARP table (supplement — catches static-IP devices)
         try:
-            local_devices = self._local_arp_scan()
+            local_devices = self._local_arp_scan(self.iface)
             for ip, mac, vendor in local_devices:
                 if ip not in seen_ips:
                     seen_ips.add(ip)
                     devices.append((ip, mac, vendor))
+                    self.device_found.emit(ip, mac, vendor)
         except Exception as e:
             print(f'[ARP] local scan: {e}')
 
@@ -198,21 +237,24 @@ class NetworkScannerThread(QThread):
     # ---- platform-specific ARP ----
 
     @staticmethod
-    def _local_arp_scan() -> List[Tuple[str, str, str]]:
+    def _local_arp_scan(iface: Optional[str] = None) -> List[Tuple[str, str, str]]:
         if IS_WINDOWS:
-            return NetworkScannerThread._arp_windows()
-        return NetworkScannerThread._arp_linux()
+            return NetworkScannerThread._arp_windows(iface)
+        return NetworkScannerThread._arp_linux(iface)
 
     @staticmethod
-    def _arp_linux() -> List[Tuple[str, str, str]]:
+    def _arp_linux(iface: Optional[str] = None) -> List[Tuple[str, str, str]]:
         """Try arp-scan first, fall back to 'ip neigh'."""
         devices: List[Tuple[str, str, str]] = []
         seen: set[str] = set()
 
         # Try arp-scan
         try:
+            cmd = ['sudo', 'arp-scan', '--localnet']
+            if iface:
+                cmd += ['-I', iface]
             result = subprocess.run(
-                ['sudo', 'arp-scan', '--localnet'],
+                cmd,
                 capture_output=True, text=True, timeout=30, check=False,
             )
             if result.returncode == 0:
@@ -230,8 +272,11 @@ class NetworkScannerThread(QThread):
 
         # Fallback: ip neigh
         try:
+            cmd = ['ip', 'neigh', 'show']
+            if iface:
+                cmd += ['dev', iface]
             result = subprocess.run(
-                ['ip', 'neigh'],
+                cmd,
                 capture_output=True, text=True, timeout=5, check=False,
             )
             for line in result.stdout.split('\n'):
@@ -248,7 +293,7 @@ class NetworkScannerThread(QThread):
         return devices
 
     @staticmethod
-    def _arp_windows() -> List[Tuple[str, str, str]]:
+    def _arp_windows(iface: Optional[str] = None) -> List[Tuple[str, str, str]]:
         """Ping-sweep the local /24 subnet, then parse 'arp -a'."""
         # Detect local subnet from the default gateway
         subnet_prefix = NetworkScannerThread._detect_subnet_windows()
@@ -427,9 +472,11 @@ class EtcHostsCache:
 class HostnameResolverThread(QThread):
     """Thread for resolving hostnames to avoid blocking UI.
 
+    All devices are resolved in parallel via a ThreadPoolExecutor.
+
     Resolution order per IP:
         0. MikroTik DHCP  (admin comments + DHCP host-name from the router)
-        1. mDNS / Avahi   (discovers phones, smart-home devices, Linux .local)
+        1. mDNS / Avahi   (per-device avahi-resolve, concurrent across devices)
         2. Reverse DNS     (PTR records — routers, servers)
         3. NetBIOS         (Windows / Samba machines)
         4. /etc/hosts      (static local mappings)
@@ -443,7 +490,6 @@ class HostnameResolverThread(QThread):
         super().__init__()
         self.devices = devices
         self.mikrotik_client = mikrotik_client
-        self.mdns = MdnsCache()
         self.etc_hosts = EtcHostsCache()
         # Filled at run-time  {ip/mac: (name, source, last_seen)}
         self.mt_ip_map: Dict[str, Tuple[str, str, str]] = {}
@@ -454,13 +500,19 @@ class HostnameResolverThread(QThread):
         if self.mikrotik_client:
             self.mt_ip_map, self.mt_mac_map = self.mikrotik_client.build_hostname_maps()
 
-        # Pre-fetch all mDNS names in one shot (~2-3 s, Linux only)
-        if not IS_WINDOWS:
-            self.mdns.refresh()
-
-        for ip, mac, vendor in self.devices:
-            hostname, method, last_seen = self._resolve(ip, mac)
-            self.resolved.emit(ip, hostname or '(Unknown)', method, last_seen)
+        # Resolve all devices in parallel; per-device avahi-resolve calls are
+        # themselves concurrent so mDNS no longer blocks on a batch sweep.
+        max_workers = min(32, max(8, len(self.devices)))
+        with ThreadPoolExecutor(max_workers=max_workers) as pool:
+            futures = {pool.submit(self._resolve, ip, mac): ip
+                       for ip, mac, _ in self.devices}
+            for future in as_completed(futures):
+                ip = futures[future]
+                try:
+                    hostname, method, last_seen = future.result()
+                except Exception:
+                    hostname, method, last_seen = None, '', ''
+                self.resolved.emit(ip, hostname or '(Unknown)', method, last_seen)
         self.finished.emit()
 
     def _resolve(self, ip: str, mac: str) -> Tuple[Optional[str], str, str]:
@@ -479,12 +531,8 @@ class HostnameResolverThread(QThread):
         if mt_entry and mt_entry[0]:
             return mt_entry[0], mt_entry[1], last_seen
 
-        # 1-2. mDNS / Avahi (Linux only)
+        # 1. mDNS / Avahi (Linux only) — runs concurrently across devices
         if not IS_WINDOWS:
-            name = self.mdns.lookup(ip)
-            if name:
-                return name, 'mDNS', last_seen
-
             name = self._avahi_resolve(ip)
             if name:
                 return name, 'mDNS', last_seen
@@ -728,6 +776,16 @@ class HostsApp(QMainWindow):
         header_layout.addWidget(title)
         header_layout.addStretch()
         
+        iface_label = QLabel('Interface:')
+        header_layout.addWidget(iface_label)
+
+        self.iface_combo = QComboBox()
+        self.iface_combo.addItem('All interfaces', userData=None)
+        for iface in get_local_interfaces():
+            self.iface_combo.addItem(iface, userData=iface)
+        self.iface_combo.setMinimumWidth(120)
+        header_layout.addWidget(self.iface_combo)
+
         self.refresh_btn = QPushButton('Refresh')
         self.refresh_btn.setMinimumWidth(100)
         self.refresh_btn.clicked.connect(self.scan_network)
@@ -771,34 +829,32 @@ class HostsApp(QMainWindow):
         self.refresh_btn.setEnabled(False)
         self.statusBar().showMessage('Scanning network...')
         self.table.setRowCount(0)
-        
-        self.scanner_thread = NetworkScannerThread(self.mikrotik_client)
+        self.table.setSortingEnabled(False)
+
+        iface = self.iface_combo.currentData()
+        self.scanner_thread = NetworkScannerThread(self.mikrotik_client, iface=iface)
+        self.scanner_thread.device_found.connect(self.on_device_found)
         self.scanner_thread.finished.connect(self.on_scan_finished)
         self.scanner_thread.error.connect(self.on_scan_error)
         self.scanner_thread.start()
 
+    def on_device_found(self, ip: str, mac: str, vendor_raw: str):
+        """Add a single device row as soon as it is discovered."""
+        row = self.table.rowCount()
+        self.table.insertRow(row)
+        self.table.setItem(row, 0, QTableWidgetItem(ip))
+        self.table.setItem(row, 1, QTableWidgetItem(mac))
+        self.table.setItem(row, 2, QTableWidgetItem('Resolving...'))
+        self.table.setItem(row, 3, QTableWidgetItem(''))
+        self.table.setItem(row, 4, LastSeenItem('', -1))
+        vendor = self.vendor_db.lookup(mac)
+        if vendor == 'Unknown' and vendor_raw and vendor_raw != '(Unknown)':
+            vendor = vendor_raw
+        self.table.setItem(row, 5, QTableWidgetItem(vendor))
+
     def on_scan_finished(self, devices: List[Tuple[str, str, str]]):
-        """Handle scan completion."""
+        """Kick off hostname resolution once scanning is complete."""
         self.devices = devices
-        # Disable sorting while populating to avoid mid-insert re-sorts
-        self.table.setSortingEnabled(False)
-        self.table.setRowCount(len(devices))
-        
-        # Populate table with initial data
-        for row, (ip, mac, vendor_raw) in enumerate(devices):
-            self.table.setItem(row, 0, QTableWidgetItem(ip))
-            self.table.setItem(row, 1, QTableWidgetItem(mac))
-            self.table.setItem(row, 2, QTableWidgetItem('Resolving...'))
-            self.table.setItem(row, 3, QTableWidgetItem(''))
-            self.table.setItem(row, 4, LastSeenItem('', -1))
-            
-            # Lookup vendor
-            vendor = self.vendor_db.lookup(mac)
-            if vendor == 'Unknown' and vendor_raw and vendor_raw != '(Unknown)':
-                vendor = vendor_raw
-            self.table.setItem(row, 5, QTableWidgetItem(vendor))
-        
-        # Resolve hostnames in background
         self.resolve_hostnames(devices)
 
     def resolve_hostnames(self, devices: List[Tuple[str, str, str]]):
