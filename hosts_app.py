@@ -255,6 +255,72 @@ class NetworkScannerThread(QThread):
             return False
 
     @staticmethod
+    def _is_wireguard(iface: str) -> bool:
+        """Return True if wg recognises the interface as a WireGuard interface."""
+        try:
+            result = subprocess.run(
+                ['wg', 'show', iface],
+                capture_output=True, text=True, timeout=5, check=False,
+            )
+            return result.returncode == 0
+        except (FileNotFoundError, subprocess.TimeoutExpired, subprocess.SubprocessError):
+            return False
+
+    @staticmethod
+    def _tailscale_scan() -> List[Tuple[str, str, str]]:
+        """Return peer IPv4 addresses from 'tailscale status --json'."""
+        devices: List[Tuple[str, str, str]] = []
+        try:
+            result = subprocess.run(
+                ['tailscale', 'status', '--json'],
+                capture_output=True, text=True, timeout=10, check=False,
+            )
+            if result.returncode != 0:
+                return devices
+            data = json.loads(result.stdout)
+            seen: set[str] = set()
+            for peer in data.get('Peer', {}).values():
+                for ip in peer.get('TailscaleIPs', []):
+                    if ':' not in ip and ip not in seen:  # IPv4 only
+                        seen.add(ip)
+                        devices.append((ip, '', ''))
+        except (subprocess.TimeoutExpired, FileNotFoundError,
+                subprocess.SubprocessError, json.JSONDecodeError):
+            pass
+        return devices
+
+    @staticmethod
+    def _wireguard_scan(iface: str) -> List[Tuple[str, str, str]]:
+        """Return peer IPv4 host addresses from 'wg show <iface> allowed-ips'.
+
+        Only /32 routes are used — these are individual peer IPs.
+        Catch-all routes like 0.0.0.0/0 are ignored.
+        """
+        devices: List[Tuple[str, str, str]] = []
+        try:
+            result = subprocess.run(
+                ['wg', 'show', iface, 'allowed-ips'],
+                capture_output=True, text=True, timeout=5, check=False,
+            )
+            if result.returncode != 0:
+                return devices
+            seen: set[str] = set()
+            for line in result.stdout.split('\n'):
+                parts = line.split()
+                if len(parts) < 2:
+                    continue
+                for cidr in parts[1:]:
+                    if '/' not in cidr:
+                        continue
+                    ip, prefix = cidr.rsplit('/', 1)
+                    if prefix == '32' and ':' not in ip and ip not in seen:
+                        seen.add(ip)
+                        devices.append((ip, '', ''))
+        except (subprocess.TimeoutExpired, FileNotFoundError, subprocess.SubprocessError):
+            pass
+        return devices
+
+    @staticmethod
     def _get_iface_addr(iface: str) -> Optional[Tuple[str, int]]:
         """Return (ip, prefix_len) of the first IPv4 address on the interface."""
         try:
@@ -308,8 +374,14 @@ class NetworkScannerThread(QThread):
     @staticmethod
     def _arp_linux(iface: Optional[str] = None) -> List[Tuple[str, str, str]]:
         """Try arp-scan first, fall back to 'ip neigh'.
-        For NOARP interfaces (WireGuard, tun) use a parallel ping sweep instead."""
-        # NOARP interfaces have no MAC layer — arp-scan and ip neigh both fail.
+        For Tailscale/WireGuard/NOARP interfaces use specialised peer discovery."""
+        if iface == 'tailscale0':
+            return NetworkScannerThread._tailscale_scan()
+
+        if iface and NetworkScannerThread._is_wireguard(iface):
+            return NetworkScannerThread._wireguard_scan(iface)
+
+        # Generic NOARP interfaces (tun, etc.) — fall back to ping sweep.
         if iface and NetworkScannerThread._is_noarp(iface):
             return NetworkScannerThread._ping_sweep_noarp(iface)
 
