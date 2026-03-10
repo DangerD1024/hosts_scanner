@@ -80,6 +80,14 @@ MIKROTIK_HOST = '192.168.0.1'
 MIKROTIK_USER = 'admin'
 MIKROTIK_PASS = 'Thm90_1234'
 
+# ---------------------------------------------------------------------------
+# Asus Router SSH client
+# ---------------------------------------------------------------------------
+
+ASUS_HOST = '192.168.50.1'
+ASUS_USER = 'DroneRouter'
+ASUS_SSH_KEY = str(Path.home() / '.ssh' / 'asus_router')
+
 
 class MikroTikClient:
     """Fetch DHCP leases (and ARP table) from MikroTik via its REST API.
@@ -183,29 +191,191 @@ class MikroTikClient:
         return ip_map, mac_map
 
 
+class AsusClient:
+    """Fetch client data from Asus router via SSH.
+
+    Reads /jffs/nmp_cl_json.js for client metadata (names, online status,
+    connection timestamps) and /tmp/dnsmasq.leases for IP-MAC mappings.
+    """
+
+    def __init__(self, host: str, username: str, ssh_key: str):
+        self.host = host
+        self.username = username
+        self.ssh_key = ssh_key
+
+    def _ssh(self, command: str, timeout: float = 10) -> str:
+        """Run a command on the router via SSH and return stdout."""
+        cmd = [
+            'ssh', '-i', self.ssh_key,
+            '-o', 'StrictHostKeyChecking=no',
+            '-o', f'ConnectTimeout={int(timeout)}',
+            '-o', 'BatchMode=yes',
+            f'{self.username}@{self.host}',
+            command,
+        ]
+        result = subprocess.run(
+            cmd, capture_output=True, text=True,
+            timeout=timeout + 5, check=False,
+            **_SUBPROCESS_FLAGS,
+        )
+        if result.returncode != 0 and not result.stdout.strip():
+            raise RuntimeError(f'SSH failed ({result.returncode}): {result.stderr.strip()}')
+        return result.stdout
+
+    def get_clients(self) -> List[dict]:
+        """Fetch all known clients with IP, MAC, hostname, online status,
+        connection timestamp, and wireless band.
+
+        Returns list of dicts with keys:
+            ip, mac, name, online, conn_ts, band, rssi
+        """
+        # 1. Client metadata from nmp_cl_json.js
+        try:
+            raw = self._ssh('cat /jffs/nmp_cl_json.js')
+            nmp_data = json.loads(raw)
+        except Exception as e:
+            print(f'[Asus] Failed to read nmp_cl_json.js: {e}')
+            nmp_data = {}
+
+        # 2. DHCP leases for IP-MAC mapping
+        mac_to_ip: Dict[str, str] = {}
+        try:
+            leases_raw = self._ssh('cat /var/lib/misc/dnsmasq.leases')
+            for line in leases_raw.strip().split('\n'):
+                parts = line.split()
+                if len(parts) >= 4:
+                    mac = parts[1].upper()
+                    ip = parts[2]
+                    mac_to_ip[mac] = ip
+        except Exception as e:
+            print(f'[Asus] Failed to read dnsmasq.leases: {e}')
+
+        # 3. WiFi client list for band info and assoc list per interface
+        wifi_info: Dict[str, dict] = {}  # mac -> {band, rssi}
+        iface_clients: Dict[str, List[str]] = {}  # iface -> [mac, ...]
+        try:
+            raw = self._ssh('cat /tmp/clientlist.json')
+            cl_data = json.loads(raw)
+            for _router_mac, bands in cl_data.items():
+                for band_name, band_clients in bands.items():
+                    for mac, info in band_clients.items():
+                        wifi_info[mac.upper()] = {
+                            'band': band_name,
+                            'rssi': info.get('rssi', ''),
+                        }
+        except Exception as e:
+            print(f'[Asus] Failed to read clientlist.json: {e}')
+
+        # 4. Get "in network" seconds from wl sta_info for each WiFi client
+        # eth2 = 2.4GHz, eth3 = 5GHz on RT-AX57
+        sta_duration: Dict[str, int] = {}  # mac -> seconds
+        try:
+            # Build a single SSH command that queries all associated clients
+            cmds = []
+            for iface in ('eth2', 'eth3'):
+                cmds.append(
+                    f'for mac in $(wl -i {iface} assoclist 2>/dev/null '
+                    f'| awk \'{{print $2}}\'); do '
+                    f'echo "STA:$mac"; '
+                    f'wl -i {iface} sta_info $mac 2>/dev/null '
+                    f'| grep "in network"; done'
+                )
+            raw = self._ssh(' ; '.join(cmds), timeout=15)
+            current_mac = ''
+            for line in raw.strip().split('\n'):
+                line = line.strip()
+                if line.startswith('STA:'):
+                    current_mac = line[4:].upper()
+                elif 'in network' in line and current_mac:
+                    m = re.search(r'in network\s+(\d+)\s+seconds', line)
+                    if m:
+                        sta_duration[current_mac] = int(m.group(1))
+        except Exception as e:
+            print(f'[Asus] Failed to get sta_info: {e}')
+
+        # Merge everything
+        clients: List[dict] = []
+        seen_macs: set = set()
+        for mac_key, entry in nmp_data.items():
+            mac = entry.get('mac', mac_key).upper()
+            if mac in seen_macs:
+                continue
+            seen_macs.add(mac)
+            ip = mac_to_ip.get(mac, '')
+            online = entry.get('online', 0) == 1
+            wi = wifi_info.get(mac, {})
+
+            # Use real WiFi association time from sta_info
+            duration_secs = sta_duration.get(mac, 0)
+
+            clients.append({
+                'ip': ip,
+                'mac': mac,
+                'name': entry.get('name', ''),
+                'online': online,
+                'duration_secs': duration_secs,
+                'band': wi.get('band', ''),
+                'rssi': wi.get('rssi', ''),
+                'vendor': entry.get('vendorclass', ''),
+            })
+
+        return clients
+
+    @staticmethod
+    def format_duration(seconds: int) -> str:
+        """Format seconds into HH:MM:SS like the Asus web UI."""
+        if seconds <= 0:
+            return ''
+        h = seconds // 3600
+        m = (seconds % 3600) // 60
+        s = seconds % 60
+        return f'{h:02d}:{m:02d}:{s:02d}'
+
+
 class NetworkScannerThread(QThread):
     """Thread for running network scan to avoid blocking UI.
 
-    Primary source: MikroTik DHCP leases (cross-platform, always available).
+    Primary source: Asus router SSH or MikroTik DHCP leases.
     Secondary: local ARP table — arp-scan on Linux, 'arp -a' on Windows.
     The two are merged so devices not in DHCP (e.g. static IPs) still appear.
     """
     device_found = pyqtSignal(str, str, str)  # ip, mac, vendor_raw
     finished = pyqtSignal(list)
     error = pyqtSignal(str)
+    # Asus clients carry extra metadata; stored here for the resolver
+    asus_clients: List[dict] = []
 
     def __init__(self, mikrotik_client: Optional['MikroTikClient'] = None,
+                 asus_client: Optional['AsusClient'] = None,
                  iface: Optional[str] = None):
         super().__init__()
         self.mikrotik_client = mikrotik_client
+        self.asus_client = asus_client
         self.iface = iface
+        self.asus_clients = []
 
     def run(self):
         seen_ips: set[str] = set()
         devices: List[Tuple[str, str, str]] = []
 
-        # 1. MikroTik DHCP leases (primary — works on every OS)
-        if self.mikrotik_client:
+        # 1a. Asus router (primary when configured)
+        if self.asus_client:
+            try:
+                self.asus_clients = self.asus_client.get_clients()
+                for cl in self.asus_clients:
+                    if not cl.get('online'):
+                        continue
+                    ip = cl['ip']
+                    mac = cl['mac']
+                    if ip and ip not in seen_ips:
+                        seen_ips.add(ip)
+                        devices.append((ip, mac, ''))
+                        self.device_found.emit(ip, mac, '')
+            except Exception as e:
+                print(f'[Asus] client fetch in scanner: {e}')
+
+        # 1b. MikroTik DHCP leases (if no Asus client)
+        if self.mikrotik_client and not self.asus_client:
             try:
                 for lease in self.mikrotik_client.get_dhcp_leases():
                     ip = lease.get('active-address', '').strip() or lease.get('address', '').strip()
@@ -229,7 +399,7 @@ class NetworkScannerThread(QThread):
             print(f'[ARP] local scan: {e}')
 
         if not devices:
-            self.error.emit('No devices found. Check network connection and MikroTik credentials.')
+            self.error.emit('No devices found. Check network connection and router credentials.')
             return
 
         self.finished.emit(devices)
@@ -615,7 +785,8 @@ class HostnameResolverThread(QThread):
     All devices are resolved in parallel via a ThreadPoolExecutor.
 
     Resolution order per IP:
-        0. MikroTik DHCP  (admin comments + DHCP host-name from the router)
+        0. Asus router     (SSH client data — names + connection duration)
+        0b. MikroTik DHCP  (admin comments + DHCP host-name from the router)
         1. mDNS / Avahi   (per-device avahi-resolve, concurrent across devices)
         2. Reverse DNS     (PTR records — routers, servers)
         3. NetBIOS         (Windows / Samba machines)
@@ -626,11 +797,21 @@ class HostnameResolverThread(QThread):
     finished = pyqtSignal()
 
     def __init__(self, devices: List[Tuple[str, str, str]],
-                 mikrotik_client: Optional[MikroTikClient] = None):
+                 mikrotik_client: Optional[MikroTikClient] = None,
+                 asus_clients: Optional[List[dict]] = None):
         super().__init__()
         self.devices = devices
         self.mikrotik_client = mikrotik_client
         self.etc_hosts = EtcHostsCache()
+        # Asus data indexed by IP and MAC
+        self.asus_by_ip: Dict[str, dict] = {}
+        self.asus_by_mac: Dict[str, dict] = {}
+        if asus_clients:
+            for cl in asus_clients:
+                if cl.get('ip'):
+                    self.asus_by_ip[cl['ip']] = cl
+                if cl.get('mac'):
+                    self.asus_by_mac[cl['mac'].upper()] = cl
         # Filled at run-time  {ip/mac: (name, source, last_seen)}
         self.mt_ip_map: Dict[str, Tuple[str, str, str]] = {}
         self.mt_mac_map: Dict[str, Tuple[str, str, str]] = {}
@@ -659,6 +840,17 @@ class HostnameResolverThread(QThread):
         """Try multiple resolution strategies, return first success.
         Returns (hostname, method, last_seen)."""
 
+        # 0. Asus router data (by IP then MAC)
+        asus_entry = self.asus_by_ip.get(ip)
+        if not asus_entry and mac:
+            asus_entry = self.asus_by_mac.get(mac.upper())
+
+        if asus_entry:
+            duration = AsusClient.format_duration(asus_entry.get('duration_secs', 0))
+            name = asus_entry.get('name', '')
+            if name and name != '*':
+                return name, 'Asus/DHCP', duration
+
         # Always grab last_seen from MikroTik if available (even if name
         # comes from another source)
         mt_entry = self.mt_ip_map.get(ip)
@@ -666,6 +858,11 @@ class HostnameResolverThread(QThread):
         if not last_seen and mac:
             mac_entry = self.mt_mac_map.get(mac.lower())
             last_seen = mac_entry[2] if mac_entry else ''
+        # If we have Asus duration, prefer it over MikroTik last_seen
+        if asus_entry:
+            duration = AsusClient.format_duration(asus_entry.get('duration_secs', 0))
+            if duration:
+                last_seen = duration
 
         # 0. MikroTik DHCP lease (by IP) — name resolution
         if mt_entry and mt_entry[0]:
@@ -866,9 +1063,25 @@ class MacVendorDB:
         return 'Unknown'
 
 
+class IpAddressItem(QTableWidgetItem):
+    """QTableWidgetItem that sorts IP addresses naturally (by numeric octets)."""
+
+    def __init__(self, ip: str):
+        super().__init__(ip)
+        try:
+            self._key = tuple(int(o) for o in ip.split('.'))
+        except (ValueError, AttributeError):
+            self._key = (999, 999, 999, 999)
+
+    def __lt__(self, other):
+        if isinstance(other, IpAddressItem):
+            return self._key < other._key
+        return super().__lt__(other)
+
+
 class LastSeenItem(QTableWidgetItem):
-    """QTableWidgetItem that sorts by the underlying seconds value
-    so that '24s' sorts before '5m30s' before '1h2m'."""
+    """QTableWidgetItem that sorts by the underlying seconds value.
+    Empty values (seconds < 0) always sort to the bottom."""
 
     def __init__(self, display: str, seconds: int):
         super().__init__(display)
@@ -876,6 +1089,13 @@ class LastSeenItem(QTableWidgetItem):
 
     def __lt__(self, other):
         if isinstance(other, LastSeenItem):
+            # Push empty (-1) to the bottom regardless of sort direction:
+            # When ascending: empty is "not less than" anything → goes last
+            # When descending: empty is "less than" everything → goes last
+            if self._seconds < 0 and other._seconds >= 0:
+                return False
+            if other._seconds < 0 and self._seconds >= 0:
+                return True
             return self._seconds < other._seconds
         return super().__lt__(other)
 
@@ -893,6 +1113,11 @@ class HostsApp(QMainWindow):
             host=MIKROTIK_HOST,
             username=MIKROTIK_USER,
             password=MIKROTIK_PASS,
+        )
+        self.asus_client = AsusClient(
+            host=ASUS_HOST,
+            username=ASUS_USER,
+            ssh_key=ASUS_SSH_KEY,
         )
         self.init_ui()
 
@@ -937,7 +1162,7 @@ class HostsApp(QMainWindow):
         self.table = QTableWidget()
         self.table.setColumnCount(6)
         self.table.setHorizontalHeaderLabels([
-            'IP Address', 'MAC Address', 'Hostname', 'Method', 'Last Seen', 'Vendor',
+            'IP Address', 'MAC Address', 'Hostname', 'Method', 'Access Time', 'Vendor',
         ])
         self.table.setSortingEnabled(True)
         
@@ -972,7 +1197,9 @@ class HostsApp(QMainWindow):
         self.table.setSortingEnabled(False)
 
         iface = self.iface_combo.currentData()
-        self.scanner_thread = NetworkScannerThread(self.mikrotik_client, iface=iface)
+        self.scanner_thread = NetworkScannerThread(
+            self.mikrotik_client, asus_client=self.asus_client, iface=iface,
+        )
         self.scanner_thread.device_found.connect(self.on_device_found)
         self.scanner_thread.finished.connect(self.on_scan_finished)
         self.scanner_thread.error.connect(self.on_scan_error)
@@ -982,7 +1209,7 @@ class HostsApp(QMainWindow):
         """Add a single device row as soon as it is discovered."""
         row = self.table.rowCount()
         self.table.insertRow(row)
-        self.table.setItem(row, 0, QTableWidgetItem(ip))
+        self.table.setItem(row, 0, IpAddressItem(ip))
         self.table.setItem(row, 1, QTableWidgetItem(mac))
         self.table.setItem(row, 2, QTableWidgetItem('Resolving...'))
         self.table.setItem(row, 3, QTableWidgetItem(''))
@@ -1002,7 +1229,10 @@ class HostsApp(QMainWindow):
         if self.hostname_thread and self.hostname_thread.isRunning():
             return
         
-        self.hostname_thread = HostnameResolverThread(devices, self.mikrotik_client)
+        asus_clients = self.scanner_thread.asus_clients if self.scanner_thread else []
+        self.hostname_thread = HostnameResolverThread(
+            devices, self.mikrotik_client, asus_clients=asus_clients,
+        )
         self.hostname_thread.resolved.connect(self.on_hostname_resolved)
         self.hostname_thread.finished.connect(self.on_hostnames_finished)
         self.hostname_thread.start()
@@ -1015,7 +1245,12 @@ class HostsApp(QMainWindow):
                 if method:
                     self.table.setItem(row, 3, QTableWidgetItem(method))
                 if last_seen:
-                    secs = MikroTikClient.parse_duration(last_seen)
+                    # Parse HH:MM:SS (Asus) or MikroTik duration
+                    hms = re.match(r'^(\d+):(\d+):(\d+)$', last_seen)
+                    if hms:
+                        secs = int(hms.group(1)) * 3600 + int(hms.group(2)) * 60 + int(hms.group(3))
+                    else:
+                        secs = MikroTikClient.parse_duration(last_seen)
                     self.table.setItem(row, 4, LastSeenItem(last_seen, secs))
                 break
 
