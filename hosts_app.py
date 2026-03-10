@@ -63,7 +63,7 @@ try:
     from PyQt6.QtWidgets import (
         QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
         QTableWidget, QTableWidgetItem, QPushButton, QLabel, QMessageBox,
-        QHeaderView, QProgressDialog, QComboBox
+        QHeaderView, QProgressDialog, QComboBox, QDialog, QTextEdit
     )
     from PyQt6.QtCore import Qt, QThread, pyqtSignal, QTimer
     from PyQt6.QtGui import QClipboard, QFont
@@ -87,6 +87,14 @@ MIKROTIK_PASS = 'Thm90_1234'
 ASUS_HOST = '192.168.50.1'
 ASUS_USER = 'DroneRouter'
 ASUS_SSH_KEY = str(Path.home() / '.ssh' / 'asus_router')
+
+# ---------------------------------------------------------------------------
+# Device SSH config (for fetching device ID from /root/config.ini)
+# ---------------------------------------------------------------------------
+
+DEVICE_SSH_KEY = str(Path.home() / '.ssh' / 'ebakaKey')
+DEVICE_SSH_USER = 'pi'
+DEVICE_ID_HOSTNAMES = {'ebaka', 'ebakam'}  # hostnames (lowercase) to query
 
 
 class MikroTikClient:
@@ -1100,14 +1108,72 @@ class LastSeenItem(QTableWidgetItem):
         return super().__lt__(other)
 
 
+class DeviceIdResolverThread(QThread):
+    """SSH into devices to fetch their device ID from /root/config.ini.
+
+    Only targets devices whose hostname matches DEVICE_ID_HOSTNAMES.
+    All SSH calls run in parallel via ThreadPoolExecutor.
+    """
+    resolved = pyqtSignal(str, str)  # ip, device_id
+    finished = pyqtSignal()
+
+    def __init__(self, devices: List[Tuple[str, str]]):
+        """devices: list of (ip, hostname) pairs to query."""
+        super().__init__()
+        self.devices = devices
+
+    def run(self):
+        max_workers = min(16, max(4, len(self.devices)))
+        with ThreadPoolExecutor(max_workers=max_workers) as pool:
+            futures = {pool.submit(self._fetch_id, ip): ip
+                       for ip, _hostname in self.devices}
+            for future in as_completed(futures):
+                ip = futures[future]
+                try:
+                    device_id = future.result()
+                except Exception:
+                    device_id = ''
+                if device_id:
+                    self.resolved.emit(ip, device_id)
+        self.finished.emit()
+
+    @staticmethod
+    def _fetch_id(ip: str) -> str:
+        """SSH into device and extract device ID from first line of config.ini."""
+        try:
+            result = subprocess.run(
+                [
+                    'ssh', '-i', DEVICE_SSH_KEY,
+                    '-o', 'StrictHostKeyChecking=no',
+                    '-o', 'ConnectTimeout=5',
+                    '-o', 'BatchMode=yes',
+                    f'{DEVICE_SSH_USER}@{ip}',
+                    'sudo cat /root/config.ini',
+                ],
+                capture_output=True, text=True, timeout=10, check=False,
+                **_SUBPROCESS_FLAGS,
+            )
+            if result.returncode != 0 or not result.stdout.strip():
+                return ''
+            first_line = result.stdout.strip().split('\n')[0]
+            # Format: RD_<12 hex chars><device_id>  e.g. RD_b3c528d36857CDMA_CM4_2
+            m = re.match(r'^RD_[0-9a-fA-F]{12}(.+)$', first_line)
+            if m:
+                return m.group(1)
+            return ''
+        except (subprocess.TimeoutExpired, FileNotFoundError, subprocess.SubprocessError):
+            return ''
+
+
 class HostsApp(QMainWindow):
     """Main application window."""
-    
+
     def __init__(self):
         super().__init__()
         self.vendor_db = MacVendorDB()
         self.scanner_thread = None
         self.hostname_thread = None
+        self.device_id_thread = None
         self.devices = []
         self.mikrotik_client = MikroTikClient(
             host=MIKROTIK_HOST,
@@ -1160,12 +1226,12 @@ class HostsApp(QMainWindow):
         
         # Table
         self.table = QTableWidget()
-        self.table.setColumnCount(6)
+        self.table.setColumnCount(7)
         self.table.setHorizontalHeaderLabels([
-            'IP Address', 'MAC Address', 'Hostname', 'Method', 'Access Time', 'Vendor',
+            'IP Address', 'MAC Address', 'Hostname', 'Device ID', 'Method', 'Access Time', 'Vendor',
         ])
         self.table.setSortingEnabled(True)
-        
+
         # Configure table
         header = self.table.horizontalHeader()
         header.setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
@@ -1173,10 +1239,12 @@ class HostsApp(QMainWindow):
         header.setSectionResizeMode(2, QHeaderView.ResizeMode.Stretch)
         header.setSectionResizeMode(3, QHeaderView.ResizeMode.ResizeToContents)
         header.setSectionResizeMode(4, QHeaderView.ResizeMode.ResizeToContents)
-        header.setSectionResizeMode(5, QHeaderView.ResizeMode.Stretch)
+        header.setSectionResizeMode(5, QHeaderView.ResizeMode.ResizeToContents)
+        header.setSectionResizeMode(6, QHeaderView.ResizeMode.Stretch)
         
-        # Make IP addresses clickable
+        # Make IP addresses clickable, Device ID double-clickable
         self.table.cellClicked.connect(self.on_cell_clicked)
+        self.table.cellDoubleClicked.connect(self.on_cell_double_clicked)
         
         layout.addWidget(self.table)
         
@@ -1212,12 +1280,13 @@ class HostsApp(QMainWindow):
         self.table.setItem(row, 0, IpAddressItem(ip))
         self.table.setItem(row, 1, QTableWidgetItem(mac))
         self.table.setItem(row, 2, QTableWidgetItem('Resolving...'))
-        self.table.setItem(row, 3, QTableWidgetItem(''))
-        self.table.setItem(row, 4, LastSeenItem('', -1))
+        self.table.setItem(row, 3, QTableWidgetItem(''))  # Device ID
+        self.table.setItem(row, 4, QTableWidgetItem(''))  # Method
+        self.table.setItem(row, 5, LastSeenItem('', -1))
         vendor = self.vendor_db.lookup(mac)
         if vendor == 'Unknown' and vendor_raw and vendor_raw != '(Unknown)':
             vendor = vendor_raw
-        self.table.setItem(row, 5, QTableWidgetItem(vendor))
+        self.table.setItem(row, 6, QTableWidgetItem(vendor))
 
     def on_scan_finished(self, devices: List[Tuple[str, str, str]]):
         """Kick off hostname resolution once scanning is complete."""
@@ -1243,7 +1312,7 @@ class HostsApp(QMainWindow):
             if self.table.item(row, 0) and self.table.item(row, 0).text() == ip:
                 self.table.setItem(row, 2, QTableWidgetItem(hostname))
                 if method:
-                    self.table.setItem(row, 3, QTableWidgetItem(method))
+                    self.table.setItem(row, 4, QTableWidgetItem(method))
                 if last_seen:
                     # Parse HH:MM:SS (Asus) or MikroTik duration
                     hms = re.match(r'^(\d+):(\d+):(\d+)$', last_seen)
@@ -1251,14 +1320,43 @@ class HostsApp(QMainWindow):
                         secs = int(hms.group(1)) * 3600 + int(hms.group(2)) * 60 + int(hms.group(3))
                     else:
                         secs = MikroTikClient.parse_duration(last_seen)
-                    self.table.setItem(row, 4, LastSeenItem(last_seen, secs))
+                    self.table.setItem(row, 5, LastSeenItem(last_seen, secs))
                 break
 
     def on_hostnames_finished(self):
-        """Hostname resolution completed."""
+        """Hostname resolution completed — start device ID resolution."""
         self.table.setSortingEnabled(True)
-        # Default sort: Last Seen ascending (most recently seen first = smallest value)
-        self.table.sortItems(4, Qt.SortOrder.AscendingOrder)
+        # Default sort: Access Time ascending (most recently connected first)
+        self.table.sortItems(5, Qt.SortOrder.AscendingOrder)
+        self.statusBar().showMessage(f'Found {len(self.devices)} devices — fetching device IDs...')
+
+        # Collect "ebaka" devices to query for device ID
+        targets: List[Tuple[str, str]] = []
+        for row in range(self.table.rowCount()):
+            hostname_item = self.table.item(row, 2)
+            ip_item = self.table.item(row, 0)
+            if hostname_item and ip_item:
+                hostname = hostname_item.text().strip().lower()
+                if hostname in DEVICE_ID_HOSTNAMES:
+                    targets.append((ip_item.text(), hostname))
+
+        if targets:
+            self.device_id_thread = DeviceIdResolverThread(targets)
+            self.device_id_thread.resolved.connect(self.on_device_id_resolved)
+            self.device_id_thread.finished.connect(self.on_device_ids_finished)
+            self.device_id_thread.start()
+        else:
+            self.refresh_btn.setEnabled(True)
+
+    def on_device_id_resolved(self, ip: str, device_id: str):
+        """Update Device ID column for a device."""
+        for row in range(self.table.rowCount()):
+            if self.table.item(row, 0) and self.table.item(row, 0).text() == ip:
+                self.table.setItem(row, 3, QTableWidgetItem(device_id))
+                break
+
+    def on_device_ids_finished(self):
+        """Device ID resolution completed."""
         self.refresh_btn.setEnabled(True)
         self.statusBar().showMessage(f'Found {len(self.devices)} devices')
 
@@ -1275,6 +1373,103 @@ class HostsApp(QMainWindow):
             clipboard = QApplication.clipboard()
             clipboard.setText(ip)
             self.statusBar().showMessage(f'Copied {ip} to clipboard', 2000)
+
+    def on_cell_double_clicked(self, row: int, col: int):
+        """Handle double-click — open config editor for Device ID column."""
+        if col != 3:  # Device ID column
+            return
+        ip_item = self.table.item(row, 0)
+        hostname_item = self.table.item(row, 2)
+        if not ip_item or not hostname_item:
+            return
+        hostname = hostname_item.text().strip().lower()
+        if hostname not in DEVICE_ID_HOSTNAMES:
+            return
+        ip = ip_item.text()
+        dlg = ConfigEditorDialog(ip, parent=self)
+        if dlg.exec() == QDialog.DialogCode.Accepted:
+            # Refresh the Device ID cell after save
+            device_id = DeviceIdResolverThread._fetch_id(ip)
+            if device_id:
+                self.table.setItem(row, 3, QTableWidgetItem(device_id))
+
+
+class ConfigEditorDialog(QDialog):
+    """Dialog to edit /root/config.ini on a remote device via SSH."""
+
+    def __init__(self, ip: str, parent=None):
+        super().__init__(parent)
+        self.ip = ip
+        self.setWindowTitle(f'config.ini — {ip}')
+        self.resize(500, 350)
+
+        layout = QVBoxLayout(self)
+
+        self.editor = QTextEdit()
+        self.editor.setFont(QFont('Monospace', 10))
+        layout.addWidget(self.editor)
+
+        btn_layout = QHBoxLayout()
+        btn_layout.addStretch()
+        self.save_btn = QPushButton('Save && Restart')
+        self.save_btn.clicked.connect(self._save)
+        btn_layout.addWidget(self.save_btn)
+        layout.addLayout(btn_layout)
+
+        self._load()
+
+    def _ssh_run(self, command: str, timeout: float = 10) -> subprocess.CompletedProcess:
+        return subprocess.run(
+            [
+                'ssh', '-i', DEVICE_SSH_KEY,
+                '-o', 'StrictHostKeyChecking=no',
+                '-o', 'ConnectTimeout=5',
+                '-o', 'BatchMode=yes',
+                f'{DEVICE_SSH_USER}@{self.ip}',
+                command,
+            ],
+            capture_output=True, text=True, timeout=timeout, check=False,
+            **_SUBPROCESS_FLAGS,
+        )
+
+    def _load(self):
+        """Fetch config.ini content from the device."""
+        try:
+            result = self._ssh_run('sudo cat /root/config.ini')
+            if result.returncode == 0:
+                self.editor.setPlainText(result.stdout)
+            else:
+                self.editor.setPlainText(f'# Error reading config.ini:\n# {result.stderr.strip()}')
+        except (subprocess.TimeoutExpired, FileNotFoundError, subprocess.SubprocessError) as e:
+            self.editor.setPlainText(f'# SSH error: {e}')
+
+    def _save(self):
+        """Write config.ini back and run sudo pkill main."""
+        content = self.editor.toPlainText()
+        try:
+            # Write file via stdin pipe to sudo tee
+            result = subprocess.run(
+                [
+                    'ssh', '-i', DEVICE_SSH_KEY,
+                    '-o', 'StrictHostKeyChecking=no',
+                    '-o', 'ConnectTimeout=5',
+                    '-o', 'BatchMode=yes',
+                    f'{DEVICE_SSH_USER}@{self.ip}',
+                    'sudo tee /root/config.ini > /dev/null',
+                ],
+                input=content, capture_output=True, text=True,
+                timeout=10, check=False, **_SUBPROCESS_FLAGS,
+            )
+            if result.returncode != 0:
+                QMessageBox.warning(self, 'Save Error', f'Failed to save:\n{result.stderr.strip()}')
+                return
+
+            # Restart the process
+            self._ssh_run('sudo pkill main')
+
+            self.accept()
+        except (subprocess.TimeoutExpired, FileNotFoundError, subprocess.SubprocessError) as e:
+            QMessageBox.warning(self, 'SSH Error', str(e))
 
 
 def main():
