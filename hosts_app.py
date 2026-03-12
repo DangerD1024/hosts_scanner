@@ -216,6 +216,7 @@ class AsusClient:
         cmd = [
             'ssh', '-i', self.ssh_key,
             '-o', 'StrictHostKeyChecking=no',
+            '-o', 'UserKnownHostsFile=/dev/null',
             '-o', f'ConnectTimeout={int(timeout)}',
             '-o', 'BatchMode=yes',
             f'{self.username}@{self.host}',
@@ -1145,6 +1146,7 @@ class DeviceIdResolverThread(QThread):
                 [
                     'ssh', '-i', DEVICE_SSH_KEY,
                     '-o', 'StrictHostKeyChecking=no',
+                    '-o', 'UserKnownHostsFile=/dev/null',
                     '-o', 'ConnectTimeout=5',
                     '-o', 'BatchMode=yes',
                     f'{DEVICE_SSH_USER}@{ip}',
@@ -1423,6 +1425,7 @@ class ConfigEditorDialog(QDialog):
             [
                 'ssh', '-i', DEVICE_SSH_KEY,
                 '-o', 'StrictHostKeyChecking=no',
+                '-o', 'UserKnownHostsFile=/dev/null',
                 '-o', 'ConnectTimeout=5',
                 '-o', 'BatchMode=yes',
                 f'{DEVICE_SSH_USER}@{self.ip}',
@@ -1452,6 +1455,7 @@ class ConfigEditorDialog(QDialog):
                 [
                     'ssh', '-i', DEVICE_SSH_KEY,
                     '-o', 'StrictHostKeyChecking=no',
+                    '-o', 'UserKnownHostsFile=/dev/null',
                     '-o', 'ConnectTimeout=5',
                     '-o', 'BatchMode=yes',
                     f'{DEVICE_SSH_USER}@{self.ip}',
