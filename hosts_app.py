@@ -5,6 +5,7 @@ Scans local network and displays devices with hostnames and vendor information.
 """
 
 import sys
+import os
 import subprocess
 import socket
 import re
@@ -13,6 +14,8 @@ import ssl
 import time
 import platform
 import base64
+import tempfile
+import atexit
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Optional, Tuple, List, Dict
@@ -86,15 +89,61 @@ MIKROTIK_PASS = 'Thm90_1234'
 
 ASUS_HOST = '192.168.50.1'
 ASUS_USER = 'DroneRouter'
-ASUS_SSH_KEY = str(Path.home() / '.ssh' / 'asus_router')
 
 # ---------------------------------------------------------------------------
 # Device SSH config (for fetching device ID from /root/config.ini)
 # ---------------------------------------------------------------------------
 
-DEVICE_SSH_KEY = str(Path.home() / '.ssh' / 'ebakaKey')
 DEVICE_SSH_USER = 'pi'
+
+# ---------------------------------------------------------------------------
+# Embedded SSH keys (written to temp files at startup, cleaned up on exit)
+# ---------------------------------------------------------------------------
+
+_ASUS_KEY = """\
+-----BEGIN OPENSSH PRIVATE KEY-----
+b3BlbnNzaC1rZXktdjEAAAAABG5vbmUAAAAEbm9uZQAAAAAAAAABAAAAMwAAAAtzc2gtZW
+QyNTUxOQAAACAxJJdJRr5AiG7YQulduc8Ra4Z9Nir5GF5t0bIcKFbZEQAAAKBtgBEqbYAR
+KgAAAAtzc2gtZWQyNTUxOQAAACAxJJdJRr5AiG7YQulduc8Ra4Z9Nir5GF5t0bIcKFbZEQ
+AAAEBkPXdLUWOm7sXzex+l29WCka9WKuZXJxK7Eb/yfAmXgDEkl0lGvkCIbthC6V25zxFr
+hn02KvkYXm3RshwoVtkRAAAAF2NsYXVkZS1jb2RlQGFzdXMtcm91dGVyAQIDBAUG
+-----END OPENSSH PRIVATE KEY-----
+"""
+
+_DEVICE_KEY = """\
+-----BEGIN OPENSSH PRIVATE KEY-----
+b3BlbnNzaC1rZXktdjEAAAAABG5vbmUAAAAEbm9uZQAAAAAAAAABAAAAMwAAAAtzc2gtZW
+QyNTUxOQAAACBwNU/cQBjNCfZ0bA9bEtxAxBvjfUItjiTLfIAsYK4pCAAAAKijhENvo4RD
+bwAAAAtzc2gtZWQyNTUxOQAAACBwNU/cQBjNCfZ0bA9bEtxAxBvjfUItjiTLfIAsYK4pCA
+AAAECUby3zJd9bJMlWJ8Lo44nRv2602gq9Hpd83+rkKVyxBnA1T9xAGM0J9nRsD1sS3EDE
+G+N9Qi2OJMt8gCxgrikIAAAAHmRhbmdlcmRAZGFuZ2VyZC1aZW5Cb29rLVE0MDZEQQECAw
+QFBgc=
+-----END OPENSSH PRIVATE KEY-----
+"""
+
+
+def _write_temp_key(key_data: str) -> str:
+    """Write an SSH key to a temp file with 0600 permissions, return path."""
+    fd, path = tempfile.mkstemp(prefix='hosts_app_key_')
+    os.write(fd, key_data.encode())
+    os.close(fd)
+    os.chmod(path, 0o600)
+    atexit.register(lambda p=path: os.unlink(p) if os.path.exists(p) else None)
+    return path
+
+
+ASUS_SSH_KEY = _write_temp_key(_ASUS_KEY)
+DEVICE_SSH_KEY = _write_temp_key(_DEVICE_KEY)
 DEVICE_ID_HOSTNAMES = {'ebaka', 'ebakam'}  # hostnames (lowercase) to query
+
+
+def _host_reachable(host: str, port: int, timeout: float = 1.0) -> bool:
+    """Quick TCP connect check — returns True if the port is open."""
+    try:
+        with socket.create_connection((host, port), timeout=timeout):
+            return True
+    except (OSError, socket.timeout):
+        return False
 
 
 class MikroTikClient:
@@ -110,13 +159,23 @@ class MikroTikClient:
         self.host = host
         self.username = username
         self.password = password
+        self.port = 443 if use_https else 80
         scheme = 'https' if use_https else 'http'
         self.base_url = f'{scheme}://{host}/rest'
+        self._reachable: Optional[bool] = None
 
     # -- helpers --
 
+    def is_reachable(self) -> bool:
+        """Quick check whether the router API port is open."""
+        if self._reachable is None:
+            self._reachable = _host_reachable(self.host, self.port)
+        return self._reachable
+
     def _get(self, path: str, timeout: float = 10) -> list:
         """Perform an authenticated GET and return parsed JSON."""
+        if not self.is_reachable():
+            return []
         url = f'{self.base_url}{path}'
         req = Request(url)
         creds = base64.b64encode(f'{self.username}:{self.password}'.encode()).decode()
@@ -210,6 +269,13 @@ class AsusClient:
         self.host = host
         self.username = username
         self.ssh_key = ssh_key
+        self._reachable: Optional[bool] = None
+
+    def is_reachable(self) -> bool:
+        """Quick check whether SSH port is open on the router."""
+        if self._reachable is None:
+            self._reachable = _host_reachable(self.host, 22)
+        return self._reachable
 
     def _ssh(self, command: str, timeout: float = 10) -> str:
         """Run a command on the router via SSH and return stdout."""
@@ -238,6 +304,9 @@ class AsusClient:
         Returns list of dicts with keys:
             ip, mac, name, online, conn_ts, band, rssi
         """
+        if not self.is_reachable():
+            return []
+
         # 1. Client metadata from nmp_cl_json.js
         try:
             raw = self._ssh('cat /jffs/nmp_cl_json.js')
@@ -904,6 +973,11 @@ class HostnameResolverThread(QThread):
             if mac_entry and mac_entry[0]:
                 return mac_entry[0], mac_entry[1], last_seen
 
+        # 7. SSH hostname (last resort — works on mobile hotspot for Pis)
+        name = self._ssh_hostname(ip)
+        if name:
+            return name, 'SSH', last_seen
+
         return None, '', last_seen
 
     # ---- individual resolvers ----
@@ -927,11 +1001,15 @@ class HostnameResolverThread(QThread):
 
     @staticmethod
     def _reverse_dns(ip: str) -> Optional[str]:
+        old_timeout = socket.getdefaulttimeout()
         try:
+            socket.setdefaulttimeout(1.5)
             hostname, _, _ = socket.gethostbyaddr(ip)
             return hostname
-        except (socket.herror, socket.gaierror, OSError):
+        except (socket.herror, socket.gaierror, OSError, socket.timeout):
             return None
+        finally:
+            socket.setdefaulttimeout(old_timeout)
 
     @staticmethod
     def _netbios(ip: str) -> Optional[str]:
@@ -951,6 +1029,29 @@ class HostnameResolverThread(QThread):
                     parts = line.split()
                     if len(parts) >= 2:
                         return parts[1].split('<')[0]
+        except (subprocess.TimeoutExpired, FileNotFoundError, subprocess.SubprocessError):
+            pass
+        return None
+
+    @staticmethod
+    def _ssh_hostname(ip: str) -> Optional[str]:
+        """Try to get hostname via SSH (works on mobile hotspot for known devices)."""
+        try:
+            result = subprocess.run(
+                [
+                    'ssh', '-i', DEVICE_SSH_KEY,
+                    '-o', 'StrictHostKeyChecking=no',
+                    '-o', 'UserKnownHostsFile=/dev/null',
+                    '-o', 'ConnectTimeout=2',
+                    '-o', 'BatchMode=yes',
+                    f'{DEVICE_SSH_USER}@{ip}',
+                    'hostname',
+                ],
+                capture_output=True, text=True, timeout=5, check=False,
+                **_SUBPROCESS_FLAGS,
+            )
+            if result.returncode == 0 and result.stdout.strip():
+                return result.stdout.strip()
         except (subprocess.TimeoutExpired, FileNotFoundError, subprocess.SubprocessError):
             pass
         return None
@@ -1191,7 +1292,7 @@ class HostsApp(QMainWindow):
 
     def init_ui(self):
         """Initialize the user interface."""
-        self.setWindowTitle('Hosts List - Network Scanner')
+        self.setWindowTitle('Hosts List - Ebaka Network Scanner')
         self.setGeometry(100, 100, 1100, 600)
         
         # Central widget
@@ -1265,6 +1366,10 @@ class HostsApp(QMainWindow):
         self.statusBar().showMessage('Scanning network...')
         self.table.setRowCount(0)
         self.table.setSortingEnabled(False)
+
+        # Reset reachability cache so network changes are detected
+        self.asus_client._reachable = None
+        self.mikrotik_client._reachable = None
 
         iface = self.iface_combo.currentData()
         self.scanner_thread = NetworkScannerThread(
@@ -1411,8 +1516,18 @@ class ConfigEditorDialog(QDialog):
         self.editor.setFont(QFont('Monospace', 10))
         layout.addWidget(self.editor)
 
+        insert_btn = QPushButton('Insert server ip')
+        insert_btn.clicked.connect(self._insert_server_ip)
+        layout.addWidget(insert_btn)
+
         btn_layout = QHBoxLayout()
         btn_layout.addStretch()
+        restart_unpacker_btn = QPushButton('Restart unpacker')
+        restart_unpacker_btn.clicked.connect(self._restart_unpacker)
+        btn_layout.addWidget(restart_unpacker_btn)
+        reboot_btn = QPushButton('Reboot')
+        reboot_btn.clicked.connect(self._reboot)
+        btn_layout.addWidget(reboot_btn)
         self.save_btn = QPushButton('Save && Restart')
         self.save_btn.clicked.connect(self._save)
         btn_layout.addWidget(self.save_btn)
@@ -1434,6 +1549,48 @@ class ConfigEditorDialog(QDialog):
             capture_output=True, text=True, timeout=timeout, check=False,
             **_SUBPROCESS_FLAGS,
         )
+
+    @staticmethod
+    def _get_local_ip() -> str:
+        """Return the local IP address used to reach the internet."""
+        try:
+            s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            s.connect(('8.8.8.8', 80))
+            ip = s.getsockname()[0]
+            s.close()
+            return ip
+        except OSError:
+            return '127.0.0.1'
+
+    def _insert_server_ip(self):
+        """Append server_ip/server_port lines at end of text."""
+        local_ip = self._get_local_ip()
+        cursor = self.editor.textCursor()
+        cursor.movePosition(cursor.MoveOperation.End)
+        self.editor.setTextCursor(cursor)
+        self.editor.insertPlainText(f'server_ip={local_ip}\nserver_port=5555\n')
+
+    def _restart_unpacker(self):
+        """Run 'sudo service unpacker restart' on the remote device."""
+        try:
+            result = self._ssh_run('sudo service unpacker restart')
+            if result.returncode == 0:
+                self.parent().statusBar().showMessage(
+                    f'Unpacker restarted on {self.ip}', 3000)
+            else:
+                QMessageBox.warning(self, 'Error',
+                                    f'Failed to restart unpacker:\n{result.stderr.strip()}')
+        except (subprocess.TimeoutExpired, FileNotFoundError, subprocess.SubprocessError) as e:
+            QMessageBox.warning(self, 'SSH Error', str(e))
+
+    def _reboot(self):
+        """Run 'sudo reboot' on the remote device."""
+        try:
+            self._ssh_run('sudo reboot')
+            self.parent().statusBar().showMessage(
+                f'Reboot sent to {self.ip}', 3000)
+        except (subprocess.TimeoutExpired, FileNotFoundError, subprocess.SubprocessError):
+            pass
 
     def _load(self):
         """Fetch config.ini content from the device."""
